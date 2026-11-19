@@ -7,6 +7,7 @@ import json
 from lxml import html as _lh
 
 from .config import SPEC
+from .gaps import GapManager
 from .store import Store
 
 
@@ -133,6 +134,24 @@ def fetch_all(http: Http):
     return records, attempts
 
 
+def fetch_event(http: Http, seq):
+    """Probe the source for one missing sequence.
+
+    Returns ``(record_or_None, status, http_attempts, error_text)``. A 404 is
+    a *non-answer* - the record may simply be temporarily invisible - so it is
+    reported, not raised. Backfill uses a tightly bounded retry budget so that
+    transient 5xx/429 responses cannot burn the gap's retry budget silently.
+    """
+    status, _hdr, body, att = http.get("/event", params={"seq": seq})
+    attempts = att + 1
+    if status == 200:
+        items = parse(body, SPEC.fmt)
+        return (items[0] if items else None), status, attempts, None
+    if status == 404:
+        return None, status, attempts, "not currently visible at source"
+    return None, status, attempts, "backfill probe failed http=%s" % status
+
+
 # --------------------------------------------------------------------------- #
 # Record identity helpers.
 # --------------------------------------------------------------------------- #
@@ -176,12 +195,56 @@ def _apply_kernel(records):
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
-def run(mode="full", con=None):
+def _ingest_backfill(store, record):
+    """Idempotent ingest for one backfilled event.
+
+    Identity is checked on the source id first so kernel annotations that
+    differ between batch and single-event processing can never create a
+    duplicate row; content-hash upsert remains the second line of defence.
+    """
+    record_id = str(record.get("id", ""))
+    existing = store.find_by_id(record_id)
+    if existing is not None:
+        return False, existing[0]
+    record = _apply_kernel([dict(record)])[0]
+    inserted = store.upsert(record)
+    if not inserted:
+        row = store.find_by_id(record_id)
+        return False, (row[0] if row else store.hash(record))
+    return True, store.hash(record)
+
+
+def _ingest_batch(store, records):
+    """Idempotent batch ingest.
+
+    The kernel's ``reduce`` step annotates the *first* record of a batch with
+    batch-wide fields (e.g. ``gap_count``), so the same event can hash
+    differently depending on which other events were fetched with it. Business
+    identity is therefore the stable source id: events already held are
+    skipped before the kernel runs, never copied with a new content hash.
+
+    Returns ``(ingested, already_held)``.
+    """
+    ingested = already_held = 0
+    for r in records:
+        if store.find_by_id(str(r.get("id", ""))) is not None:
+            already_held += 1
+            continue
+        if store.upsert(r):
+            ingested += 1
+        else:
+            already_held += 1
+    return ingested, already_held
+
+
+def run(mode="full", con=None, gap_backfill=True):
     own = con is None
     con = con or Store().connect()
     store = Store(con)
     sleeper = Sleeper()
     http = Http(Transport(), sleeper)
+    gm = GapManager(store)
+    run_id, stale_runs = gm.begin_run(mode)
     try:
         records, attempts = fetch_all(http)
         norm = [normalize(dict(r)) for r in records]
@@ -192,15 +255,41 @@ def run(mode="full", con=None):
         if mode == "incremental" and wm:
             norm = [r for r in norm if str(r.get("ts", "")) > wm]
 
-        ingested = sum(1 for r in norm if store.upsert(r))
+        ingested, already_held = _ingest_batch(store, norm)
         total = store.count()
         new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
         if new_wm:
             store.set_watermark(new_wm)
+
+        # Reconciliation runs on the full page set even in incremental mode:
+        # a cross-page hole is about sequence adjacency, not the ts window.
+        reconciliation = gm.reconcile(
+            records, run_id,
+            page_evidence={"endpoint": "/" + SPEC.endpoint,
+                           "http_attempts": attempts,
+                           "records_in_batch": len(records)})
+        gap_stats = {"visited": 0, "resolved": [], "failed": [], "exhausted": [],
+                     "duplicates": 0, "http_attempts": 0}
+        if gap_backfill:
+            backfill_http = Http(Transport(), sleeper, max_retries=1,
+                                 base_backoff=0.5, politeness=0.25)
+            gap_stats = gm.backfill_pending(
+                run_id,
+                lambda seq: fetch_event(backfill_http, seq),
+                lambda rec: _ingest_backfill(store, rec))
+        gm.finish_run(run_id, "completed")
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
-                "duplicates": dup_in_batch, "ingested": ingested, "count": total,
+                "duplicates": dup_in_batch, "ingested": ingested,
+                "already_held": already_held, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "watermark": store.watermark(),
+                "gap_run_id": run_id, "recovered_runs": stale_runs,
+                "gaps_detected": reconciliation,
+                "gap_backfill": gap_stats,
+                "gaps_open": len(store.list_gaps("open"))}
+    except Exception:
+        gm.finish_run(run_id, "failed", "pipeline raised before completion")
+        raise
     finally:
         if own:
             con.close()
@@ -278,13 +367,15 @@ def run_rpa(con=None):
     con = con or Store().connect()
     store = Store(con)
     r = Rpa()
+    gm = GapManager(store)
+    run_id, stale_runs = gm.begin_run("rpa")
     try:
         logged = r.login()
         items = r.collect()
         norm = [normalize(dict(it)) for it in items]
         norm, dup = dedup(norm)
         norm = _apply_kernel(norm)
-        ingested = sum(1 for x in norm if store.upsert(x))
+        ingested, _already = _ingest_batch(store, norm)
         total = store.count()
         created = dedup_submit = 0
         for x in norm[:2]:
@@ -298,10 +389,20 @@ def run_rpa(con=None):
         wm = max([str(x.get("ts", "")) for x in norm] + [""])
         if wm:
             store.set_watermark(wm)
+        reconciliation = gm.reconcile(
+            items, run_id,
+            page_evidence={"endpoint": "/query", "collected": len(items)})
+        gm.finish_run(run_id, "completed")
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
                 "ingested": ingested, "count": total,
-                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
+                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log,
+                "gap_run_id": run_id, "recovered_runs": stale_runs,
+                "gaps_detected": reconciliation,
+                "gaps_open": len(store.list_gaps("open"))}
+    except Exception:
+        gm.finish_run(run_id, "failed", "rpa pipeline raised before completion")
+        raise
     finally:
         if own:
             con.close()

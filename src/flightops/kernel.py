@@ -1,9 +1,25 @@
 
-def _seq(rec):
+"""Flight operation event transforms.
+
+The sequence number is the operational identity used for gap detection: the
+numeric part of the source id (``FLI-0007`` -> 7). Extraction lives here so the
+store, pipeline and fixture all interpret ids identically.
+"""
+
+
+def seq_of(rec):
     s = "".join(ch for ch in str(rec.get("id", "")) if ch.isdigit())
     return int(s) if s else 0
+
+
+def _seq(rec):
+    return seq_of(rec)
+
+
 def process(record):
     return {"seq": _seq(record)}
+
+
 def reduce(records):
     seqs = sorted({r["seq"] for r in records})
     gapset = set()
